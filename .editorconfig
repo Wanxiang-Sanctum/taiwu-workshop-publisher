@@ -1,0 +1,20 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[*.cs]
+dotnet_analyzer_diagnostic.severity = warning
+
+csharp_style_namespace_declarations = file_scoped:warning
+
+# Tooling code intentionally awaits process boundaries directly.
+dotnet_diagnostic.CA2007.severity = none
+
+# Unused using cleanup is left to editor tooling; CI keeps analyzer noise focused on behavioral diagnostics.
+dotnet_diagnostic.IDE0005.severity = none
+
+# Guard clauses are clearer than conditional return expressions in CLI validation.
+dotnet_style_prefer_conditional_expression_over_return = false:warning

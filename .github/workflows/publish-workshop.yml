@@ -1,0 +1,299 @@
+name: Publish Workshop
+run-name: Publish ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - publishing
+    paths:
+      - publishing/workshop.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_NOLOGO: "true"
+  MANIFEST_FILE: publishing/workshop.yml
+
+jobs:
+  matrix:
+    name: Build Publish Matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    outputs:
+      count: ${{ steps.matrix.outputs.count }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5.4.0
+        with:
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore Taiwu.WorkshopPublisher.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build Taiwu.WorkshopPublisher.slnx --no-restore
+
+      - name: Resolve manifest baseline
+        id: previous
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FIRST_COMMIT_SHA: ${{ github.event.commits[0].id }}
+        run: |
+          set -euo pipefail
+
+          previous_manifest="artifacts/previous-workshop.yml"
+          baseline_commit=""
+          baseline_message=""
+
+          if [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            if [[ -z "${FIRST_COMMIT_SHA}" ]]; then
+              echo "Could not determine the first pushed commit; refusing to publish without a manifest baseline." >&2
+              exit 1
+            fi
+
+            if ! parent_line="$(git rev-list --parents -n 1 "${FIRST_COMMIT_SHA}")"; then
+              echo "Could not resolve first pushed commit ${FIRST_COMMIT_SHA}; refusing to publish without a manifest baseline." >&2
+              exit 1
+            fi
+
+            read -r _ parent_sha extra_parent_sha <<< "${parent_line}"
+
+            if [[ -z "${parent_sha:-}" ]]; then
+              mkdir -p "$(dirname "${previous_manifest}")"
+              cp "${MANIFEST_FILE}" "${previous_manifest}"
+              echo "Publishing branch has no parent commit; using the current manifest as the initialization baseline."
+              echo "previous_manifest=${previous_manifest}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            if [[ -n "${extra_parent_sha:-}" ]]; then
+              echo "First pushed commit ${FIRST_COMMIT_SHA} has multiple parents; refusing to infer a manifest baseline." >&2
+              exit 1
+            fi
+
+            if git cat-file -e "${parent_sha}:${MANIFEST_FILE}" 2> /dev/null; then
+              baseline_commit="${parent_sha}"
+              baseline_message="Publishing branch has no previous ref; using ${baseline_commit} as the manifest baseline."
+            else
+              mkdir -p "$(dirname "${previous_manifest}")"
+              cp "${MANIFEST_FILE}" "${previous_manifest}"
+              echo "Publishing branch parent ${parent_sha} does not contain ${MANIFEST_FILE}; using the current manifest as the initialization baseline."
+              echo "previous_manifest=${previous_manifest}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          else
+            baseline_commit="${BEFORE_SHA}"
+            baseline_message="Using previous ref ${baseline_commit} as the manifest baseline."
+          fi
+
+          if ! git cat-file -e "${baseline_commit}^{commit}" 2> /dev/null; then
+            echo "Could not resolve manifest baseline commit ${baseline_commit}; refusing to publish without a baseline." >&2
+            exit 1
+          fi
+
+          if git cat-file -e "${baseline_commit}:${MANIFEST_FILE}" 2> /dev/null; then
+            mkdir -p "$(dirname "${previous_manifest}")"
+            git show "${baseline_commit}:${MANIFEST_FILE}" > "${previous_manifest}"
+            echo "${baseline_message}"
+            echo "previous_manifest=${previous_manifest}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Manifest baseline commit ${baseline_commit} does not contain ${MANIFEST_FILE}; refusing to publish without a baseline." >&2
+            exit 1
+          fi
+
+      - name: Build publish matrix
+        id: matrix
+        env:
+          PREVIOUS_MANIFEST_FILE: ${{ steps.previous.outputs.previous_manifest }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            build-matrix
+            --manifest "${MANIFEST_FILE}"
+            --github-output "${GITHUB_OUTPUT}"
+          )
+
+          if [[ -n "${PREVIOUS_MANIFEST_FILE}" ]]; then
+            args+=(--previous-manifest "${PREVIOUS_MANIFEST_FILE}")
+          fi
+
+          dotnet run --no-build --project tools/Taiwu.WorkshopPublisher.Cli -- "${args[@]}"
+
+  publish:
+    name: Publish ${{ matrix.mod_id }}
+    needs:
+      - matrix
+    if: ${{ needs.matrix.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: steam-workshop
+    env:
+      STEAMCMD_DIR: artifacts/steamcmd-runtime
+      VDF_PATH: artifacts/steamcmd/workshop-item.vdf
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5.4.0
+        with:
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore Taiwu.WorkshopPublisher.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build Taiwu.WorkshopPublisher.slnx --no-restore
+
+      - name: Resolve publish target
+        id: release
+        run: >
+          dotnet run --no-build --project tools/Taiwu.WorkshopPublisher.Cli --
+          resolve-target
+          --manifest "${MANIFEST_FILE}"
+          --mod-id "${{ matrix.mod_id }}"
+          --artifacts-root artifacts
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Download GitHub release asset
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_REPOSITORY_TOKEN || github.token }}
+          RELEASE_REPOSITORY: ${{ steps.release.outputs.release_repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          RELEASE_ASSET_DIR: ${{ steps.release.outputs.release_asset_dir }}
+        run: |
+          gh release download "${RELEASE_TAG}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --pattern "*.zip" \
+            --dir "${RELEASE_ASSET_DIR}" \
+            --clobber
+
+      - name: Prepare workshop content
+        id: content
+        env:
+          RELEASE_ASSET_DIR: ${{ steps.release.outputs.release_asset_dir }}
+          EXTRACT_DIR: ${{ steps.release.outputs.extract_dir }}
+        run: >
+          dotnet run --no-build --project tools/Taiwu.WorkshopPublisher.Cli --
+          prepare-content
+          --release-asset-dir "${RELEASE_ASSET_DIR}"
+          --extract-dir "${EXTRACT_DIR}"
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Generate SteamCMD VDF
+        env:
+          CONTENT_DIR: ${{ steps.content.outputs.content_dir }}
+          FILE_ID: ${{ steps.release.outputs.file_id }}
+        run: >
+          dotnet run --no-build --project tools/Taiwu.WorkshopPublisher.Cli --
+          vdf
+          --content-dir "${CONTENT_DIR}"
+          --file-id "${FILE_ID}"
+          --output "${VDF_PATH}"
+
+      - name: Cache SteamCMD
+        uses: actions/cache@v6.1.0
+        with:
+          path: artifacts/steamcmd-runtime
+          key: steamcmd-${{ runner.os }}-${{ runner.arch }}-v1
+          restore-keys: |
+            steamcmd-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up SteamCMD
+        id: steamcmd
+        env:
+          STEAMCMD_HOME: ${{ runner.temp }}/steamcmd-home
+        run: |
+          set -euo pipefail
+
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl tar lib32gcc-s1 lib32stdc++6
+
+          rm -rf \
+            "${STEAMCMD_DIR}/config" \
+            "${STEAMCMD_DIR}"/ssfn*
+          install -d -m 700 "${STEAMCMD_HOME}"
+
+          steamcmd_executable="${STEAMCMD_DIR}/steamcmd.sh"
+          if [[ ! -x "${steamcmd_executable}" ]] || ! HOME="${STEAMCMD_HOME}" "${steamcmd_executable}" +quit; then
+            mkdir -p "${STEAMCMD_DIR}"
+            curl --fail --location --show-error --silent \
+              https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
+              | tar -xzf - -C "${STEAMCMD_DIR}"
+            chmod +x "${steamcmd_executable}"
+            HOME="${STEAMCMD_HOME}" "${steamcmd_executable}" +quit
+          fi
+
+          echo "steamcmd_executable=${steamcmd_executable}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore SteamCMD auth
+        env:
+          STEAMCMD_HOME: ${{ runner.temp }}/steamcmd-home
+          STEAM_CONFIG_VDF: ${{ secrets.STEAM_CONFIG_VDF }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${STEAM_CONFIG_VDF}" ]]; then
+            echo "STEAM_CONFIG_VDF is required for CI publishing." >&2
+            exit 1
+          fi
+
+          install -d -m 700 "${STEAMCMD_HOME}/Steam/config"
+          printf '%s' "${STEAM_CONFIG_VDF}" > "${STEAMCMD_HOME}/Steam/config/config.vdf"
+          chmod 600 "${STEAMCMD_HOME}/Steam/config/config.vdf"
+
+      - name: Publish to Steam Workshop
+        env:
+          STEAMCMD_HOME: ${{ runner.temp }}/steamcmd-home
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAMCMD_EXECUTABLE: ${{ steps.steamcmd.outputs.steamcmd_executable }}
+        run: >
+          dotnet run --no-build --project tools/Taiwu.WorkshopPublisher.Cli --
+          publish
+          --steamcmd "${STEAMCMD_EXECUTABLE}"
+          --steam-home "${STEAMCMD_HOME}"
+          --vdf "${VDF_PATH}"
+
+      - name: Remove SteamCMD auth state
+        if: ${{ always() }}
+        env:
+          STEAMCMD_HOME: ${{ runner.temp }}/steamcmd-home
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            "${STEAMCMD_HOME}" \
+            "${STEAMCMD_DIR}/config" \
+            "${STEAMCMD_DIR}"/ssfn*
