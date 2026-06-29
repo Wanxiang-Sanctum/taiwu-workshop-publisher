@@ -1,12 +1,22 @@
 # tools
 
-本目录维护仓库内 C# 命令行工具。
+本目录维护仓库内 C# 命令行工具。本文件面向需要理解或调试 CLI 的维护者，说明它和 GitHub Actions workflow 之间的执行契约。
 
-## Taiwu.WorkshopPublisher.Cli
+如果你只是使用模板发布 Mod，通常只需要维护 `publishing/workshop.yml` 和 GitHub Environment，见 [publishing/README.md](../publishing/README.md)。仓库维护流程、验证命令和文档同步规则见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
-`Taiwu.WorkshopPublisher.Cli` 是发布 workflow 和本地校验共用的执行器。它读取 `publishing/` 下的 YAML 发布清单，定位已打包 Mod 目录中的 `Config.Lua`，校验发布内容，生成 SteamCMD workshop item VDF，并可调用已经可用的 SteamCMD。
+## CLI 边界
 
-命令行解析由 `System.CommandLine` 负责，YAML 解析由 `YamlDotNet` 负责，Lua 语法解析由 `Loretta.CodeAnalysis.Lua` 负责，SteamCMD 调用由 `CliWrap` 负责。CLI 只做发布协调和字段提取；`Config.Lua` 读取是静态字段提取，不执行 Lua 代码，也不读取 Mod 仓库源码结构或重新组包。
+`Taiwu.WorkshopPublisher.Cli` 是发布 workflow 和本地诊断共用的执行器。它读取 `publishing/` 下的 YAML 发布清单，定位已打包 Mod 目录中的 `Config.Lua`，校验发布内容，生成 SteamCMD workshop item VDF，并可调用已经可用的 SteamCMD。
+
+CLI 只做发布协调和字段提取：
+
+- 不读取或理解 Mod 仓库源码结构。
+- 不构建、不重新组包 GitHub Release asset。
+- 不创建新的 Steam Workshop item。
+- 不执行 Lua 代码；`Config.Lua` 读取是静态字段提取。
+- 不管理 Steam Guard 交互；CI 认证状态由 workflow 通过 `STEAM_CONFIG_VDF` 准备。
+
+命令行解析由 `System.CommandLine` 负责，YAML 解析由 `YamlDotNet` 负责，Lua 语法解析由 `Loretta.CodeAnalysis.Lua` 负责，SteamCMD 调用由 `CliWrap` 负责。
 
 ## 命令
 
@@ -17,7 +27,9 @@
 - `vdf`：生成 SteamCMD workshop item VDF；要求传入清单中的 `fileId`，并校验它与 `Config.Lua` 的 `FileId` 一致。
 - `publish`：使用已生成的 VDF 调用 SteamCMD；从 `STEAM_USERNAME` 读取账号名，不读取账号密码；已信任的 SteamCMD 会话状态由调用方准备，可用 `--steam-home` 指向该状态所在的 SteamCMD HOME。
 
-## 示例
+`validate` 和 `vdf` 默认拒绝发布目录中的 `Settings.Lua`，避免把本机玩家设置发布出去。确有需要时必须显式传入 `--allow-settings`；当前发布 workflow 调用 `vdf` 时不传入该选项。
+
+## 命令示例
 
 解析发布目标：
 
@@ -61,4 +73,12 @@ dotnet run --project tools/Taiwu.WorkshopPublisher.Cli -- vdf `
   --output artifacts/steamcmd/workshop-item.vdf
 ```
 
-`validate` 和 `vdf` 默认拒绝发布目录中的 `Settings.Lua`，避免把本机玩家设置发布出去。确有需要时必须显式传入 `--allow-settings`。
+调用 SteamCMD 发布已有 VDF：
+
+```powershell
+$env:STEAM_USERNAME = "steam-account"
+dotnet run --project tools/Taiwu.WorkshopPublisher.Cli -- publish `
+  --steamcmd path/to/steamcmd `
+  --steam-home path/to/trusted-steam-home `
+  --vdf artifacts/steamcmd/workshop-item.vdf
+```
